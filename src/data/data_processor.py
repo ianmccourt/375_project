@@ -65,6 +65,137 @@ class NetworkDataProcessor:
         print(f"Data loaded with shape: {df.shape}")
         return df
     
+    def load_tii_ssrc_dataset(self, file_path, target_column='label'):
+        """
+        Load and preprocess TII-SSRC-23 dataset.
+        
+        Args:
+            file_path (str): Path to the TII-SSRC-23 dataset
+            target_column (str): Name of the target column (default is 'label' for TII-SSRC-23)
+            
+        Returns:
+            pd.DataFrame: Preprocessed dataframe
+        """
+        print(f"Loading TII-SSRC-23 dataset from {file_path}...")
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        
+        # Load the dataset
+        df = pd.read_csv(file_path)
+        
+        # Handle TII-SSRC-23 specific preprocessing
+        
+        # 1. Set the target column
+        self.target_column = target_column
+        
+        # 2. Map the target/label column to binary format (if needed)
+        # Check if the label is already binary or needs conversion
+        if target_column in df.columns and not set(df[target_column].unique()).issubset({0, 1}):
+            print(f"Converting {target_column} to binary format...")
+            # Map attack categories to 0 (anomaly) and normal traffic to 1 (normal)
+            # Assuming "Normal" or "Benign" labels for normal traffic, adjust as needed
+            if df[target_column].dtype == 'object':
+                normal_labels = ['Normal', 'Benign', 'normal', 'benign']
+                df[target_column] = df[target_column].apply(lambda x: 1 if x in normal_labels else 0)
+            # If it's numeric but not binary, map all non-zero values to 0 (anomaly)
+            elif df[target_column].dtype in ['int64', 'float64']:
+                # If the dataset uses 0 for normal and other values for attacks, invert the logic
+                if 0 in df[target_column].unique() and df[target_column].nunique() > 2:
+                    df[target_column] = df[target_column].apply(lambda x: 1 if x == 0 else 0)
+        
+        # 3. Map column names to standardized format
+        column_mapping = self._get_tii_ssrc_column_mapping()
+        
+        # Apply mapping only for columns that exist in the dataframe
+        valid_mapping = {k: v for k, v in column_mapping.items() if k in df.columns}
+        if valid_mapping:
+            df = df.rename(columns=valid_mapping)
+        
+        # 4. Ensure timestamp is in datetime format
+        timestamp_col = next((col for col in df.columns if 'time' in col.lower()), None)
+        if timestamp_col and pd.api.types.is_string_dtype(df[timestamp_col]):
+            try:
+                df[timestamp_col] = pd.to_datetime(df[timestamp_col])
+            except:
+                print(f"Warning: Could not convert {timestamp_col} to datetime format.")
+        
+        # 5. Add derived features if possible
+        df = self._add_derived_features_tii_ssrc(df)
+        
+        print(f"TII-SSRC-23 dataset loaded and preprocessed with shape: {df.shape}")
+        print(f"Class distribution: {df[self.target_column].value_counts().to_dict()}")
+        
+        return df
+    
+    def _get_tii_ssrc_column_mapping(self):
+        """
+        Get column mapping from TII-SSRC-23 dataset format to standardized format.
+        
+        Returns:
+            dict: Column mapping dictionary
+        """
+        # Mapping from TII-SSRC-23 column names to standardized names
+        # Adjust this mapping based on the actual column names in your dataset
+        return {
+            'src_ip': 'Source IP',
+            'dst_ip': 'Destination IP',
+            'src_port': 'Source Port',
+            'dst_port': 'Destination Port',
+            'protocol': 'Protocol',
+            'timestamp': 'Timestamp',
+            'duration': 'Flow Duration',
+            'total_fwd_packets': 'Total Fwd Packets',
+            'total_bwd_packets': 'Total Backward Packets',
+            'total_length_of_fwd_packets': 'Total Length of Fwd Packets',
+            'total_length_of_bwd_packets': 'Total Length of Bwd Packets',
+            'fwd_packet_length_max': 'Fwd Packet Length Max',
+            'fwd_packet_length_min': 'Fwd Packet Length Min',
+            'fwd_packet_length_mean': 'Fwd Packet Length Mean',
+            'bwd_packet_length_max': 'Bwd Packet Length Max', 
+            'bwd_packet_length_min': 'Bwd Packet Length Min',
+            'bwd_packet_length_mean': 'Bwd Packet Length Mean',
+            'flow_bytes_per_s': 'Flow Bytes/s',
+            'flow_packets_per_s': 'Flow Packets/s',
+            'label': 'Label'
+        }
+    
+    def _add_derived_features_tii_ssrc(self, df):
+        """
+        Add derived features specific to network traffic.
+        
+        Args:
+            df (pd.DataFrame): Input dataframe
+            
+        Returns:
+            pd.DataFrame: Dataframe with added features
+        """
+        # Only add these features if we have the necessary columns
+        try:
+            # Calculate bytes per packet if we have both packets and bytes
+            if 'Total Fwd Packets' in df.columns and 'Total Length of Fwd Packets' in df.columns:
+                df['Fwd Bytes per Packet'] = df['Total Length of Fwd Packets'] / df['Total Fwd Packets'].replace(0, 1)
+            
+            if 'Total Backward Packets' in df.columns and 'Total Length of Bwd Packets' in df.columns:
+                df['Bwd Bytes per Packet'] = df['Total Length of Bwd Packets'] / df['Total Backward Packets'].replace(0, 1)
+            
+            # Calculate packet ratio
+            if 'Total Fwd Packets' in df.columns and 'Total Backward Packets' in df.columns:
+                total_packets = df['Total Fwd Packets'] + df['Total Backward Packets']
+                df['Fwd Packet Ratio'] = df['Total Fwd Packets'] / total_packets.replace(0, 1)
+                df['Bwd Packet Ratio'] = df['Total Backward Packets'] / total_packets.replace(0, 1)
+            
+            # Identify scan-like behavior
+            if 'Destination IP' in df.columns and 'Source IP' in df.columns:
+                # Count distinct destinations per source
+                if len(df) > 1:  # Only if we have more than one row
+                    src_ip_counts = df.groupby('Source IP')['Destination IP'].nunique()
+                    ip_counts_dict = src_ip_counts.to_dict()
+                    df['Distinct Destinations Count'] = df['Source IP'].map(ip_counts_dict)
+        except Exception as e:
+            print(f"Warning: Could not add some derived features. Error: {e}")
+        
+        return df
+    
     def identify_column_types(self, df):
         """
         Identify numerical and categorical columns in the dataframe.

@@ -1,0 +1,427 @@
+# TII-SSRC-23 Dataset Analysis with UBA System
+
+This notebook demonstrates how to use the UBA system with the TII-SSRC-23 cybersecurity dataset.
+
+## 1. Setup Environment and Clone Repository
+
+```python
+# Mount Google Drive (if you're storing the dataset there)
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Clone the repository
+!git clone https://github.com/your-username/375_project.git
+%cd 375_project
+
+# Install required packages
+!pip install -r requirements.txt
+
+# Add the project directory to the Python path
+import sys
+sys.path.append('/content/375_project')
+
+# Check if imports work
+try:
+    from src.data.data_processor import NetworkDataProcessor
+    from src.models.anomaly_detector import AnomalyDetector, EnsembleAnomalyDetector
+    from src.utils.behavioral_profiling import EntityProfiler
+    from src.config import config
+    print("✅ Imports successful!")
+except ImportError as e:
+    print(f"❌ Import error: {e}")
+```
+
+## 2. Load and Explore the TII-SSRC-23 Dataset
+
+```python
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Set path to the dataset
+# If stored in Google Drive:
+dataset_path = '/content/drive/MyDrive/Datasets/TII-SSRC-23.csv'
+# Or if downloaded directly to Colab:
+# dataset_path = '/content/TII-SSRC-23.csv'
+
+# Initialize data processor
+processor = NetworkDataProcessor(scaling_method='standard', handle_imbalance=True)
+
+# Load TII-SSRC-23 dataset
+df = processor.load_tii_ssrc_dataset(dataset_path, target_column='label')
+
+# Display basic information about the dataset
+print("Dataset shape:", df.shape)
+print("\nFirst few rows:")
+display(df.head())
+
+# Check class distribution
+if 'Label' in df.columns:
+    print("\nClass distribution:")
+    display(df['Label'].value_counts())
+    
+    # Plot class distribution
+    plt.figure(figsize=(10, 6))
+    sns.countplot(x='Label', data=df)
+    plt.title('Class Distribution')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+```
+
+## 3. Analyze Dataset Features
+
+```python
+# Explore dataset features
+print("Columns in the dataset:")
+print(df.columns.tolist())
+
+# Display summary statistics
+print("\nSummary statistics for numerical features:")
+display(df.describe())
+
+# Check for missing values
+print("\nMissing values in each column:")
+display(df.isnull().sum())
+
+# If 'Source IP' is in the columns, analyze IP distribution
+if 'Source IP' in df.columns:
+    print("\nTop Source IPs:")
+    display(df['Source IP'].value_counts().head(10))
+
+# If 'Protocol' is in the columns, analyze protocol distribution
+if 'Protocol' in df.columns:
+    print("\nProtocol distribution:")
+    display(df['Protocol'].value_counts())
+    
+    # Plot protocol distribution
+    plt.figure(figsize=(10, 6))
+    sns.countplot(x='Protocol', data=df)
+    plt.title('Protocol Distribution')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+```
+
+## 4. Preprocess the Data
+
+```python
+# Identify column types
+processor.target_column = 'Label'
+numerical_columns, categorical_columns = processor.identify_column_types(df)
+
+# Handle missing values
+df = processor.handle_missing_values(df)
+
+# Display information about numerical and categorical features
+print(f"Numerical features ({len(numerical_columns)}):")
+print(numerical_columns[:10], "..." if len(numerical_columns) > 10 else "")
+print(f"\nCategorical features ({len(categorical_columns)}):")
+print(categorical_columns)
+
+# Limit dataset size for Colab memory constraints if needed
+# df = df.sample(100000, random_state=42) if len(df) > 100000 else df
+
+# Preprocess data
+X_train, X_val, X_test, y_train, y_val, y_test = processor.preprocess_data(
+    df, 
+    categorical_encoding='onehot',
+    handle_imbalance_method='smote'
+)
+
+print(f"\nTraining set: {X_train.shape}")
+print(f"Validation set: {X_val.shape}")
+print(f"Test set: {X_test.shape}")
+
+# Check class distribution after preprocessing
+print("\nClass distribution after preprocessing:")
+print(f"Training set: {pd.Series(y_train).value_counts().to_dict()}")
+print(f"Validation set: {pd.Series(y_val).value_counts().to_dict()}")
+print(f"Test set: {pd.Series(y_test).value_counts().to_dict()}")
+```
+
+## 5. Train and Evaluate Models
+
+```python
+# Create results directory
+import os
+results_dir = '/content/375_project/results/tii_ssrc_notebook'
+os.makedirs(results_dir, exist_ok=True)
+
+# Train and evaluate Isolation Forest
+print("\n=== Isolation Forest ===\n")
+isolation_forest = AnomalyDetector(model_type='isolation_forest', contamination=0.05)
+isolation_forest.fit(X_train)
+isolation_forest.find_optimal_threshold(X_val, y_val, metric='f1')
+isolation_forest_metrics = isolation_forest.evaluate(X_test, y_test)
+
+# Train and evaluate One-Class SVM
+print("\n=== One-Class SVM ===\n")
+one_class_svm = AnomalyDetector(model_type='one_class_svm')
+one_class_svm.fit(X_train)
+one_class_svm.find_optimal_threshold(X_val, y_val, metric='f1')
+one_class_svm_metrics = one_class_svm.evaluate(X_test, y_test)
+
+# Train and evaluate Local Outlier Factor
+print("\n=== Local Outlier Factor ===\n")
+lof = AnomalyDetector(model_type='local_outlier_factor', contamination=0.05)
+lof.fit(X_train)
+lof.find_optimal_threshold(X_val, y_val, metric='f1')
+lof_metrics = lof.evaluate(X_test, y_test)
+
+# Compare model performance
+metrics_df = pd.DataFrame([
+    {'Model': 'Isolation Forest', **isolation_forest_metrics},
+    {'Model': 'One-Class SVM', **one_class_svm_metrics},
+    {'Model': 'Local Outlier Factor', **lof_metrics}
+])
+
+display(metrics_df)
+
+# Plot comparison
+plt.figure(figsize=(15, 6))
+metrics_to_plot = ['precision', 'recall', 'f1', 'false_positive_rate']
+
+for i, metric in enumerate(metrics_to_plot):
+    plt.subplot(1, len(metrics_to_plot), i+1)
+    sns.barplot(x='Model', y=metric, data=metrics_df)
+    plt.title(metric.capitalize())
+    plt.ylim(0, 1)
+    plt.xticks(rotation=45)
+
+plt.tight_layout()
+plt.show()
+```
+
+## 6. Create and Evaluate Ensemble Model
+
+```python
+# Create an ensemble of models
+print("\n=== Ensemble Model ===\n")
+ensemble = EnsembleAnomalyDetector(voting='soft')
+
+# Add individual models to the ensemble
+ensemble.add_model(isolation_forest)
+ensemble.add_model(one_class_svm)
+ensemble.add_model(lof)
+
+# Evaluate the ensemble
+ensemble.find_optimal_threshold(X_val, y_val, metric='f1')
+ensemble_metrics = ensemble.evaluate(X_test, y_test)
+
+# Add ensemble metrics to the comparison
+metrics_df = pd.concat([
+    metrics_df,
+    pd.DataFrame([{'Model': 'Ensemble', **ensemble_metrics}])
+])
+
+display(metrics_df)
+
+# Plot updated comparison
+plt.figure(figsize=(15, 6))
+for i, metric in enumerate(metrics_to_plot):
+    plt.subplot(1, len(metrics_to_plot), i+1)
+    sns.barplot(x='Model', y=metric, data=metrics_df)
+    plt.title(metric.capitalize())
+    plt.ylim(0, 1)
+    plt.xticks(rotation=45)
+
+plt.tight_layout()
+plt.show()
+```
+
+## 7. Perform Behavioral Profiling
+
+```python
+# Initialize entity profiler
+print("\n=== Behavioral Profiling ===\n")
+profiler = EntityProfiler(entity_column='Source IP', time_window=300)
+
+# Find timestamp column - Different datasets might name this differently
+timestamp_columns = [col for col in df.columns if 'time' in col.lower()]
+timestamp_column = timestamp_columns[0] if timestamp_columns else None
+
+if timestamp_column:
+    print(f"Using {timestamp_column} for temporal analysis")
+    
+    # Create entity features
+    entity_features = profiler.create_entity_features(df, timestamp_column)
+    
+    # Display entity features
+    print("Entity features:")
+    display(entity_features.head())
+    
+    # Build entity profiles
+    entity_profiles = profiler.build_entity_profiles(entity_features)
+    
+    # Detect anomalous entities
+    anomalous_entities = profiler.detect_anomalous_entities(threshold=2.0)
+    
+    # Display anomalous entities
+    print(f"\nDetected {len(anomalous_entities)} anomalous entities")
+    
+    if anomalous_entities:
+        anomalies_df = pd.DataFrame([
+            {
+                'entity': entity,
+                'anomaly_score': data['anomaly_score'],
+                'num_anomalous_features': data['num_anomalous_features'],
+                'total_features': data['total_features']
+            }
+            for entity, data in anomalous_entities.items()
+        ])
+        
+        display(anomalies_df.head(10))
+        
+        # Plot anomaly scores
+        plt.figure(figsize=(12, 6))
+        sns.barplot(x='entity', y='anomaly_score', data=anomalies_df.head(10))
+        plt.title('Top 10 Anomalous Entities')
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.show()
+else:
+    print("No timestamp column found in the dataset. Skipping behavioral profiling.")
+```
+
+## 8. Cluster Entities
+
+```python
+# If behavioral profiling was successful, cluster the entities
+if 'entity_features' in locals() and 'profiler' in locals():
+    # Cluster entities
+    print("\n=== Entity Clustering ===\n")
+    clustered_entities = profiler.cluster_entities(n_clusters=5, method='kmeans')
+    
+    # Display cluster information
+    cluster_counts = clustered_entities['cluster'].value_counts().sort_index()
+    print("Entities per cluster:")
+    display(cluster_counts)
+    
+    # Visualize entity clusters
+    profiler.visualize_entity_clusters(clustered_entities)
+    
+    # If there are anomalous entities, track one of them over time
+    if anomalous_entities:
+        # Get the most anomalous entity
+        most_anomalous = list(anomalous_entities.keys())[0]
+        
+        # Track its behavior over time
+        print(f"\n=== Tracking Behavior of Entity {most_anomalous} ===\n")
+        entity_data = profiler.track_entity_behavior_over_time(entity_features, most_anomalous)
+```
+
+## 9. Combine Anomaly Detection and Behavioral Profiling
+
+```python
+# Check if both anomaly detection and behavioral profiling were performed
+if 'ensemble_metrics' in locals() and 'anomalous_entities' in locals() and anomalous_entities:
+    print("\n=== Combining Anomaly Detection and Behavioral Profiling ===\n")
+    
+    # Get anomaly scores from the ensemble model
+    anomaly_scores = ensemble.decision_function(X_test)
+    
+    # Create a dataframe with test data and anomaly scores
+    test_df = X_test.copy()
+    test_df['true_label'] = y_test
+    test_df['anomaly_score'] = anomaly_scores
+    test_df['predicted_label'] = ensemble.predict(X_test)
+    
+    # If 'Source IP' is in the test data, we can combine with behavioral profiling
+    if 'Source IP' in test_df.columns:
+        # Get the list of anomalous entities
+        anomalous_ips = list(anomalous_entities.keys())
+        
+        # Mark rows with anomalous entities
+        test_df['entity_anomalous'] = test_df['Source IP'].isin(anomalous_ips)
+        
+        # Combine predictions: flag as anomaly if both model and behavioral profiling agree
+        test_df['combined_prediction'] = ((test_df['predicted_label'] == -1) & test_df['entity_anomalous']).astype(int)
+        test_df['combined_prediction'] = test_df['combined_prediction'].replace({0: 1, 1: -1})  # Convert to 1/-1 format
+        
+        # Calculate metrics for the combined approach
+        from sklearn.metrics import confusion_matrix, classification_report
+        
+        # Convert true labels to match model output (1 for normal, -1 for anomaly)
+        y_test_converted = np.where(y_test == 0, -1, 1)
+        
+        # Calculate metrics
+        combined_cm = confusion_matrix(y_test_converted, test_df['combined_prediction'])
+        combined_report = classification_report(y_test_converted, test_df['combined_prediction'], output_dict=True)
+        
+        # Calculate false positive rate
+        tn, fp, fn, tp = combined_cm.ravel()
+        combined_fpr = fp / (fp + tn)
+        
+        # Compile metrics
+        combined_metrics = {
+            'accuracy': combined_report['accuracy'],
+            'precision': combined_report['-1']['precision'],  # Precision for anomaly class
+            'recall': combined_report['-1']['recall'],  # Recall for anomaly class
+            'f1': combined_report['-1']['f1-score'],  # F1 for anomaly class
+            'false_positive_rate': combined_fpr
+        }
+        
+        # Add combined metrics to the comparison
+        metrics_df = pd.concat([
+            metrics_df,
+            pd.DataFrame([{'Model': 'Combined Approach', **combined_metrics}])
+        ])
+        
+        display(metrics_df)
+        
+        # Plot updated comparison
+        plt.figure(figsize=(15, 6))
+        for i, metric in enumerate(metrics_to_plot):
+            plt.subplot(1, len(metrics_to_plot), i+1)
+            sns.barplot(x='Model', y=metric, data=metrics_df)
+            plt.title(metric.capitalize())
+            plt.ylim(0, 1)
+            plt.xticks(rotation=45)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Plot confusion matrix for the combined approach
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(combined_cm, annot=True, fmt='d', cmap='Blues', 
+                    xticklabels=['Normal', 'Anomaly'], 
+                    yticklabels=['Normal', 'Anomaly'])
+        plt.xlabel('Predicted')
+        plt.ylabel('True')
+        plt.title('Confusion Matrix - Combined Approach')
+        plt.tight_layout()
+        plt.show()
+    else:
+        print("'Source IP' column not found in the test data. Cannot combine with behavioral profiling.")
+else:
+    print("Either anomaly detection or behavioral profiling was not performed. Cannot combine approaches.")
+```
+
+## 10. Save Results
+
+```python
+# Save the final model
+if 'ensemble' in locals():
+    from google.colab import files
+    
+    # For saving to Google Drive
+    model_path = os.path.join(results_dir, 'ensemble_model.joblib')
+    ensemble.save_model(model_path)
+    print(f"Ensemble model saved to {model_path}")
+    
+    # Download model file (optional)
+    # files.download(model_path)
+
+# Save the entity profiles if available
+if 'profiler' in locals() and hasattr(profiler, 'entity_profiles') and profiler.entity_profiles:
+    profile_path = os.path.join(results_dir, 'entity_profiles.csv')
+    profiler.save_profiles(profile_path)
+    print(f"Entity profiles saved to {profile_path}")
+    
+    # Download profiles file (optional)
+    # files.download(profile_path)
+
+print("\nNotebook execution completed!") 
