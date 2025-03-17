@@ -16,6 +16,11 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import config
 
+import gc
+import time
+from google.colab import drive
+import psutil
+
 
 class NetworkDataProcessor:
     """
@@ -549,6 +554,203 @@ class NetworkDataProcessor:
         return df
 
 
+# Comprehensive approach for safely loading large CSV files in Google Colab
+class LargeCSVHandler:
+    def __init__(self, file_path, target_column='label'):
+        self.file_path = file_path
+        self.target_column = target_column
+        self.memory_limit_gb = 4.0  # Use at most 4GB for dataset
+        self.chunk_size = 100000
+        
+    def check_file(self):
+        """Check if file exists and its size"""
+        if not os.path.exists(self.file_path):
+            raise FileNotFoundError(f"File not found: {self.file_path}")
+        
+        self.file_size_gb = os.path.getsize(self.file_path) / (1024**3)
+        print(f"File exists. Size: {self.file_size_gb:.2f} GB")
+        
+        # Get available memory
+        self.available_memory_gb = psutil.virtual_memory().available / (1024**3)
+        print(f"Available memory: {self.available_memory_gb:.2f} GB")
+        
+        # Determine if we need sampling
+        if self.file_size_gb > self.memory_limit_gb:
+            print(f"File is larger than memory limit ({self.memory_limit_gb:.1f} GB). Will use sampling.")
+            return False
+        else:
+            print("File size is within memory limits. Can load complete file.")
+            return True
+    
+    def analyze_columns(self):
+        """Analyze column structure without loading entire file"""
+        # Read just the header and first few rows
+        header_sample = pd.read_csv(self.file_path, nrows=5)
+        print(f"\nFile has {len(header_sample.columns)} columns.")
+        
+        # Check for label column
+        if self.target_column not in header_sample.columns:
+            potential_labels = [col for col in header_sample.columns 
+                              if 'label' in col.lower() or 'class' in col.lower() or 'target' in col.lower()]
+            if potential_labels:
+                self.target_column = potential_labels[0]
+                print(f"Target column not found. Using '{self.target_column}' instead.")
+            else:
+                print("Warning: No obvious target column found.")
+        
+        # Identify likely important columns
+        ip_cols = [col for col in header_sample.columns if 'ip' in col.lower()]
+        time_cols = [col for col in header_sample.columns if 'time' in col.lower()]
+        feature_cols = [col for col in header_sample.columns 
+                       if any(key in col.lower() for key in ['flow', 'packet', 'byte', 'port', 'protocol'])]
+        
+        print(f"IP columns: {ip_cols}")
+        print(f"Time columns: {time_cols}")
+        print(f"Sample feature columns: {feature_cols[:5]}...")
+        
+        return header_sample.columns.tolist()
+    
+    def count_rows(self):
+        """Count rows in file without loading it completely"""
+        try:
+            # Fast row counting for smaller files
+            if self.file_size_gb < 1:
+                row_count = sum(1 for _ in open(self.file_path)) - 1  # Subtract header
+            else:
+                # Estimate from file size and first chunk
+                first_chunk = pd.read_csv(self.file_path, nrows=self.chunk_size)
+                chunk_size_bytes = first_chunk.memory_usage(deep=True).sum()
+                estimated_rows = int((self.file_size_gb * 1024**3) / (chunk_size_bytes / len(first_chunk)))
+                row_count = estimated_rows
+                del first_chunk
+                gc.collect()
+            
+            print(f"Estimated row count: {row_count:,}")
+            self.row_count = row_count
+            return row_count
+            
+        except Exception as e:
+            print(f"Error estimating row count: {e}")
+            self.row_count = None
+            return None
+    
+    def determine_sample_size(self):
+        """Determine appropriate sample size based on file size and memory"""
+        # Starting with memory-based calculation
+        if not hasattr(self, 'row_count') or self.row_count is None:
+            self.count_rows()
+        
+        # Calculate rows we can safely load
+        safe_rows = int((self.memory_limit_gb * 1024**3) / (self.file_size_gb * 1024**3 / self.row_count))
+        
+        # Cap at either row_count or 1 million rows
+        sample_size = min(self.row_count, safe_rows, 1000000)
+        
+        # Calculate sampling ratio
+        sample_ratio = sample_size / self.row_count
+        
+        print(f"\nSampling strategy:")
+        print(f"- Maximum safe sample size: {sample_size:,} rows")
+        print(f"- Sampling ratio: {sample_ratio:.2%}")
+        
+        self.sample_size = sample_size
+        self.sample_ratio = sample_ratio
+        return sample_size
+        
+    def load_data(self, use_sampling=None, columns=None):
+        """Load data with appropriate strategy"""
+        # Determine if sampling is needed
+        if use_sampling is None:
+            use_sampling = not self.check_file()
+        
+        start_time = time.time()
+        
+        # Strategy 1: Load full file if possible
+        if not use_sampling:
+            print("\nLoading complete dataset...")
+            if columns:
+                df = pd.read_csv(self.file_path, usecols=columns)
+            else:
+                df = pd.read_csv(self.file_path)
+        
+        # Strategy 2: Random sampling for medium-sized files
+        elif self.file_size_gb < 2 and self.sample_ratio > 0.1:
+            print("\nLoading random sample of rows...")
+            self.determine_sample_size()
+            skiprows = self._generate_skiprows(self.sample_ratio)
+            
+            if columns:
+                df = pd.read_csv(self.file_path, skiprows=skiprows, usecols=columns)
+            else:
+                df = pd.read_csv(self.file_path, skiprows=skiprows)
+            
+        # Strategy 3: Chunked loading for very large files
+        else:
+            print("\nLoading data in chunks...")
+            self.determine_sample_size()
+            chunks = []
+            total_rows = 0
+            
+            for chunk in pd.read_csv(self.file_path, chunksize=self.chunk_size, usecols=columns):
+                # Sample from this chunk
+                chunk_sample = chunk.sample(frac=self.sample_ratio)
+                chunks.append(chunk_sample)
+                
+                # Update progress
+                total_rows += len(chunk_sample)
+                print(f"  Progress: {total_rows:,} rows loaded", end='\r')
+                
+                # Stop if we've reached our target sample size
+                if total_rows >= self.sample_size:
+                    break
+                
+                # Clean up memory
+                del chunk
+                gc.collect()
+            
+            print("\nCombining chunks...")
+            df = pd.concat(chunks, ignore_index=True)
+            del chunks
+            gc.collect()
+            
+        duration = time.time() - start_time
+        print(f"\nLoaded {len(df):,} rows with {len(df.columns):,} columns in {duration:.1f} seconds")
+        
+        # Verify target column is present
+        if self.target_column not in df.columns:
+            print(f"Warning: Target column '{self.target_column}' not found in data!")
+            potential_targets = [col for col in df.columns 
+                               if 'label' in col.lower() or 'class' in col.lower()]
+            if potential_targets:
+                self.target_column = potential_targets[0]
+                print(f"Using '{self.target_column}' as target instead.")
+        
+        return df
+    
+    def _generate_skiprows(self, sample_ratio):
+        """Generate rows to skip for efficient sampling"""
+        # Generate a list of rows to skip
+        if not hasattr(self, 'row_count') or self.row_count is None:
+            self.count_rows()
+            
+        # Calculate how many rows to skip
+        rows_to_keep = int(self.row_count * sample_ratio)
+        rows_to_skip = self.row_count - rows_to_keep
+        
+        if rows_to_skip <= 0:
+            return None
+            
+        # Randomly select rows to skip (but always keep header row)
+        np.random.seed(42)  # For reproducibility
+        skip_indices = np.random.choice(
+            range(1, self.row_count + 1),  # +1 for header
+            size=rows_to_skip, 
+            replace=False
+        )
+        
+        return lambda x: x > 0 and x in skip_indices
+
+
 if __name__ == "__main__":
     # Example usage
     processor = NetworkDataProcessor(scaling_method='standard', handle_imbalance=True)
@@ -556,4 +758,99 @@ if __name__ == "__main__":
     # This is just a placeholder - in a real scenario, you would provide the actual file path
     # df = processor.load_data(os.path.join(config.DATA_DIR, "network_traffic.csv"))
     
-    print("Data processor module created successfully") 
+    print("Data processor module created successfully")
+
+    # Step 1: Mount Google Drive
+    print("Mounting Google Drive...")
+    drive.mount('/content/drive', force_remount=True)
+
+    # Step 2: Define the dataset path
+    dataset_path = '/content/drive/MyDrive/Datasets/TII-SSRC-23.csv'  # Adjust this path if needed
+
+    # Step 4: Use the handler to load and process the data
+    try:
+        # Initialize the handler
+        print("\n=== Initializing Dataset Handler ===")
+        handler = LargeCSVHandler(dataset_path)
+        
+        # Analyze the file and determine loading strategy
+        print("\n=== Analyzing Dataset ===")
+        handler.check_file()
+        all_columns = handler.analyze_columns()
+        handler.count_rows()
+        
+        # Determine essential columns to reduce memory usage
+        # Group 1: Core columns that we always need
+        essential_cols = ['label', 'src_ip', 'dst_ip', 'timestamp', 'protocol']
+        
+        # Group 2: Use standard column mapping from your processor
+        column_mapping = {
+            'src_ip': 'Source IP',
+            'dst_ip': 'Destination IP',
+            'src_port': 'Source Port',
+            'dst_port': 'Destination Port',
+            'protocol': 'Protocol',
+            'timestamp': 'Timestamp',
+            'duration': 'Flow Duration',
+            'total_fwd_packets': 'Total Fwd Packets',
+            'total_bwd_packets': 'Total Backward Packets',
+            'total_length_of_fwd_packets': 'Total Length of Fwd Packets',
+            'total_length_of_bwd_packets': 'Total Length of Bwd Packets',
+            'label': 'Label'
+        }
+        
+        # Combine and filter to columns that exist in the dataset
+        target_columns = list(set(essential_cols + list(column_mapping.keys())))
+        target_columns = [col for col in target_columns if col in all_columns]
+        
+        # Add some additional feature columns if they exist
+        for col in all_columns:
+            if any(key in col.lower() for key in ['byte', 'packet', 'flow', 'port']):
+                if col not in target_columns:
+                    target_columns.append(col)
+                    if len(target_columns) >= 30:  # Limit to ~30 total columns
+                        break
+        
+        print(f"\nSelected {len(target_columns)} columns for loading:")
+        print(target_columns)
+        
+        # Load the data with appropriate strategy
+        print("\n=== Loading Dataset ===")
+        df = handler.load_data(use_sampling=True, columns=target_columns)
+        
+        # Now process with your NetworkDataProcessor
+        print("\n=== Processing Dataset ===")
+        from src.data.data_processor import NetworkDataProcessor
+        
+        # Initialize processor
+        processor = NetworkDataProcessor(scaling_method='standard', handle_imbalance=True)
+        
+        # Set target column
+        processor.target_column = handler.target_column
+        
+        # Display basic dataset info
+        print("\nDataset preview:")
+        display(df.head())
+        
+        print("\nClass distribution:")
+        display(df[handler.target_column].value_counts())
+        
+        # Process the data
+        print("\nPreprocessing data...")
+        X_train, X_val, X_test, y_train, y_val, y_test = processor.preprocess_data(
+            df, 
+            categorical_encoding='onehot',
+            handle_imbalance_method='smote'
+        )
+        
+        print("\nPreprocessing complete!")
+        print(f"Training set: {X_train.shape}")
+        print(f"Validation set: {X_val.shape}")
+        print(f"Test set: {X_test.shape}")
+        
+        # Training data is now ready for your models
+        
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc() 
